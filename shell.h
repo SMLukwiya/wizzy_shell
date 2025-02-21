@@ -42,6 +42,6 @@ typedef struct process {
 void eval(char *cmdline);
 int parseline(char *buf, char **argv);
 int builtin_command(char **argv);
-int scan_paths();
+int find_command();
 
 #endif

@@ -5,7 +5,7 @@ const char *builtin_commands[] = {
   "exec", "printf", "read", "test", "if", "then", "else", "fi", "case", "for", "while", "until", "break",
   "continue", "return", "exit", "help", "history", "type", "ulimit", "source", "."};
 
-char *common_paths = "/bin:/usr/bin:/usr/local/bin";
+char *common_paths[] = {"/bin", "/usr/bin", "/usr/local/bin", NULL};
 
 void unix_error(char *msg) {
     fprintf(stderr, "%s: %s\n", msg, strerror(errno));
@@ -69,22 +69,14 @@ void eval(char *cmdline) {
 
     if (!builtin_command(argv)) {
         if ((pid = Fork()) == 0) {
-            /* check for ./ or / (e.g, /bin/ls or ./prog) */
-            if (!(strncmp(argv[0], "/", 1)) || !(strncmp(argv[0], "./", 2))) {
-                if (execve(argv[0], argv, environ) < 0) {
-                    printf("%s: command not found.\n", argv[0]);
+            if (find_command(argv[0], final_command) < 0) {
+                printf("%s: command not found.\n", final_command);
+                exit(0);
+            } else {
+                if (execve(final_command, argv, environ) < 0) {
+                    printf("%s: command not found.\n", final_command);
                     exit(0);
                 }
-            }
-
-            // should I attempt to first execute or look up
-            if (scan_paths(argv[0], final_command) < 0) {
-                printf("%s: command not found.\n", argv[0]);
-                exit(0);
-            }
-            if (execve(final_command, argv, environ) < 0) {
-                printf("%s: command not found.\n", argv[0]);
-                exit(0);
             }
         }
 
@@ -99,35 +91,46 @@ void eval(char *cmdline) {
     return;
 }
 
-int scan_paths(char *command, char *final_command) {
-    char *paths;
-    if (!(paths = getenv("PATH")))
-        paths = common_paths;
+/* Check in dir */
+int find_in_dir(char *dirname, char *command, char *final_command) {
+    sprintf(final_command, "%s/%s", dirname, command);
+    if (access(final_command, X_OK) == 0) {
+        return 0;
+    }
 
+    final_command = NULL;
+    return -1;
+}
+
+int find_command(char *command, char *final_command) {
+    char *paths;
     const char *delimiter = ":";
+    int i;
+
+    for (i = 0; common_paths[i]; i++) {
+        char *res;
+        if (find_in_dir(common_paths[i], command, final_command) == 0) {
+            return 0;
+        };
+    }
+
+    if (!(paths = getenv("PATH"))) {
+        final_command = NULL;
+        return -1;
+    }
+
     char *token;
     token = strtok(paths, delimiter);
-    DIR *directory;
-    struct dirent *entry;
 
     while (token != NULL) {
-        if ((directory = opendir(token)) == NULL) {
-            fprintf(stderr, "Directory issues\n");
-            return -1;
-        }
-
-        while ((entry = readdir(directory))) {
-            if (!(strcmp(command, entry->d_name))) {
-                sprintf(final_command, "%s/%s", token, command);
-                return 0;
-            }
-            // fprintf(stderr, "Entry issues\n");
-            // return -1;
-        }
-        // printf("Token: %s\n", entry);
-
+        char *res;
+        if (find_in_dir(token, command, final_command) == 0) {
+            return 0;
+        };
         token = strtok(NULL, delimiter);
     }
+
+    final_command = NULL;
     return -1;
 }
 
@@ -141,7 +144,8 @@ int builtin_command(char **argv) {
     return 0;
 }
 
-int getShellPrompt(char *buf) {
+/* shell prompt structure */
+int get_shell_prompt(char *buf) {
     char hostname[MAXARGS];
     char cwd[MAXARGS];
     struct passwd *user;
@@ -166,7 +170,7 @@ int main() {
     char cmdline[MAXLINE];
     char buf[MAXARGS * 3];
 
-    getShellPrompt(buf);
+    get_shell_prompt(buf);
     while (1) {
         /* Read */
         printf("%s$ ", buf);
