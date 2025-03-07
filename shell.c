@@ -18,12 +18,12 @@
 
 extern char **environ;
 
-typedef struct hist_entry {
+typedef struct {
     char *line;
     unsigned int entry_num;
 } hist_entry;
 
-typedef struct hist_buffer {
+typedef struct {
     hist_entry *entries;
     int head_index;
     int tail_index;
@@ -37,10 +37,37 @@ typedef struct {
 typedef int (*builtin_func)(shell_context *ctx, char **args);
 typedef void signal_handler(int signum);
 
-typedef struct builtin_command {
+typedef struct {
     char *command_name;
     builtin_func function;
 } builtin_command;
+
+enum TokenType {
+    TOKEN_COMMAND,
+    TOKEN_ARGUMENT,
+    TOKEN_PIPE,
+    TOKEN_REDIRECT_OUTPUT,
+    TOKEN_REDIRECT_APPEND,
+    TOKEN_REDIRECT_ERROR,
+    TOKEN_SEMICOLON,
+    TOKEN_AND,
+    TOKEN_OR,
+    TOKEN_VARIABLE,
+    TOKEN_STRING,
+    TOKEN_WHITESPACE,
+    TOKEN_ERROR,
+    TOKEN_EOF
+};
+
+typedef struct {
+    enum TokenType type;
+    char *value;
+} token;
+
+typedef struct {
+    token *tokens;
+    int token_count;
+} tokens;
 
 int entry_number;
 char *command_buf;
@@ -72,6 +99,7 @@ void signal_register(int signum, signal_handler handler) {
     return;
 }
 
+/* Initialize circular buffer */
 void init_hist_buffer(hist_buffer *history) {
     if (!(history->entries = (hist_entry *)malloc(sizeof(hist_entry) * HISTSIZE)))
         unix_error("malloc");
@@ -81,6 +109,7 @@ void init_hist_buffer(hist_buffer *history) {
     history->entry_count = 0;
 }
 
+/* Add command to history buffer */
 void add_to_history(hist_buffer *history, char *command) {
     hist_entry entry;
 
@@ -97,6 +126,7 @@ void add_to_history(hist_buffer *history, char *command) {
     history->entries[history->head_index] = entry;
 }
 
+/* Get history entry from buffer */
 hist_entry *get_entry(hist_buffer *history, int index) {
     if (index < 0) {
         /* offset */
@@ -110,6 +140,7 @@ hist_entry *get_entry(hist_buffer *history, int index) {
     return &(history->entries[idx]);
 }
 
+/* Print history */
 void print_history(hist_buffer *history) {
     printf("Command History:\n");
     for (int i = 0; i < history->entry_count; i++) {
@@ -118,12 +149,14 @@ void print_history(hist_buffer *history) {
     }
 }
 
-/* Built in commands */
+/* ==== Built in commands ===== */
+/* History command */
 int history_command(shell_context *ctx, char **args) {
     print_history(ctx->history);
     return 1;
 }
 
+/* Exit command */
 int exit_command(shell_context *ctx, char **args) {
     for (int i = 0; i < ctx->history->entry_count; i++)
         free(ctx->history->entries[i].line);
@@ -132,11 +165,13 @@ int exit_command(shell_context *ctx, char **args) {
     exit(0);
 }
 
+/* Simple lookup table */
 builtin_command builtins[] = {
   {"history", history_command},
   {"exit", exit_command},
   {NULL, NULL}};
 
+/* Is command builtin */
 int is_builtin_command(char *command) {
     for (int i = 0; builtins[i].command_name != NULL; i++)
         if (strcmp(command, builtins[i].command_name) == 0)
@@ -145,6 +180,7 @@ int is_builtin_command(char *command) {
     return -1;
 }
 
+/* Print colored shell prompt */
 void shell_prompt(char *shell_p) {
     char hostname[MAXARGS];
     char cwd[MAXARGS];
@@ -164,6 +200,7 @@ void shell_prompt(char *shell_p) {
     sprintf(shell_p, "\x1b[1;32m%s@%s\x1b[0;37m:\x1b[1;34m~%s\x1b[0;37m", user->pw_name, hostname, cwd);
 }
 
+/* Remove leading and traling whitespaces from user input */
 void trim_whitespace(char **start) {
     char *end;
     while (isspace((unsigned char)**start))
@@ -175,6 +212,7 @@ void trim_whitespace(char **start) {
     *(end + 1) = '\0';
 }
 
+/* Expand user Input from history buffer */
 char *expand_history(shell_context *ctx, char *command) {
     char *p = command;
     size_t expanded_length = strlen(command) * 2; // anticipate
@@ -240,6 +278,7 @@ char *expand_history(shell_context *ctx, char *command) {
                 return NULL;
             }
 
+            /* Anticipate size and adjust when exceeded */
             if (current_pos == end_pos) {
                 size_t len = strlen(expanded_command);
                 expanded_length *= 2;
@@ -250,6 +289,7 @@ char *expand_history(shell_context *ctx, char *command) {
             strcat(expanded_command, history_entry->line);
             current_pos += strlen(history_entry->line);
         } else {
+            /* Anticipate size and adjust when exceeded */
             if (current_pos == end_pos) {
                 size_t len = strlen(expanded_command);
                 expanded_length *= 2;
@@ -269,14 +309,26 @@ char *expand_history(shell_context *ctx, char *command) {
     return expanded_command;
 }
 
+/* Extract tokens */
+tokens *tokenize(char *command) {
+    int in_quotes = 0;
+    char *p = command;
+    tokens *tokens_ptr;
+    if ((tokens_ptr = (tokens *)malloc(1024)) == NULL) { // just some starting value
+        perror("malloc");
+        return NULL;
+    }
+
+    while (*p) {
+        // do magic
+    }
+}
+
+/* Parse user input */
 int parse_command(char *command, char **argv) {
     char *token;
     char *delimiter = " \t";
     int argc, background;
-
-    /* empty command */
-    if (*command == '\0')
-        return 1;
 
     token = strtok(command, delimiter);
 
@@ -292,6 +344,7 @@ int parse_command(char *command, char **argv) {
     return background;
 }
 
+/* Execute parsed command */
 void execute_command(shell_context *ctx, char **argv, int background, int builtin_idx) {
     pid_t pid;
     int status;
@@ -320,6 +373,7 @@ void execute_command(shell_context *ctx, char **argv, int background, int builti
     return;
 }
 
+/*Evaluate command */
 void eval_command(char *command, shell_context *ctx) {
     char *argv[MAXARGS];
     int background;
@@ -354,12 +408,14 @@ void eval_command(char *command, shell_context *ctx) {
     return;
 }
 
+/* Handler child termination (job mgt) */
 void sig_handler(int signum) {
     while (waitpid(-1, NULL, WNOHANG) > 0)
         printf(" ");
     return;
 }
 
+/* Handle kill signal */
 void sig_term_handler(int signum) {
     write(STDOUT_FILENO, " \n", 3);
     memset(command_buf, 0, MAXLINE);
