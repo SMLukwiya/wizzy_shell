@@ -14,6 +14,7 @@
 #define MAXLINE 8192
 #define MAXARGS 128
 #define HISTSIZE 1000
+#define INITIAL_CAPACITY 64
 #define MIN(x, y) (x > y ? y : x)
 
 extern char **environ;
@@ -42,13 +43,15 @@ typedef struct {
     builtin_func function;
 } builtin_command;
 
-enum TokenType {
+enum token_type {
     TOKEN_COMMAND,
     TOKEN_ARGUMENT,
     TOKEN_PIPE,
     TOKEN_REDIRECT_OUTPUT,
+    TOKEN_REDIRECT_INPUT,
     TOKEN_REDIRECT_APPEND,
     TOKEN_REDIRECT_ERROR,
+    TOKEN_BACKGROUND,
     TOKEN_SEMICOLON,
     TOKEN_AND,
     TOKEN_OR,
@@ -60,17 +63,20 @@ enum TokenType {
 };
 
 typedef struct {
-    enum TokenType type;
+    enum token_type type;
     char *value;
 } token;
 
 typedef struct {
-    token *tokens;
+    token **tokens;
     int token_count;
-} tokens;
+    int capacity;
+} token_list;
 
 int entry_number;
 char *command_buf;
+// remove after finishing
+token_list *list;
 
 /* APIS */
 void execute_command(shell_context *ctx, char **argv, int background, int builtin_idx);
@@ -162,6 +168,8 @@ int exit_command(shell_context *ctx, char **args) {
         free(ctx->history->entries[i].line);
 
     free(ctx->history->entries);
+    if (list)
+        free(list);
     exit(0);
 }
 
@@ -309,18 +317,232 @@ char *expand_history(shell_context *ctx, char *command) {
     return expanded_command;
 }
 
-/* Extract tokens */
-tokens *tokenize(char *command) {
-    int in_quotes = 0;
-    char *p = command;
-    tokens *tokens_ptr;
-    if ((tokens_ptr = (tokens *)malloc(1024)) == NULL) { // just some starting value
+/* Tokenization */
+/* add to token list */
+int add_token(token_list *list, enum token_type token_type, const char *token_value) {
+    if (list->token_count >= list->capacity) {
+        list->capacity *= 2;
+        list->tokens = realloc(list->tokens, list->capacity * sizeof(token *));
+        if (!list->tokens) {
+            perror("realloc");
+            return -1;
+        }
+    }
+
+    token *new_token_entry = malloc(sizeof(token));
+    if (!new_token_entry) {
+        perror("malloc");
+        return -1;
+    }
+
+    char *value = strdup(token_value);
+    if (!value) {
+        free(new_token_entry);
+        perror("malloc");
+        return -1;
+    }
+
+    new_token_entry->value = value;
+    new_token_entry->type = token_type;
+    list->tokens[list->token_count++] = new_token_entry;
+    return 0;
+}
+
+/* free token */
+void free_tokens(token_list *list) {
+    for (int i = 0; i < list->token_count; i++) {
+        free(list->tokens[i]->value);
+        free(list->tokens[i]);
+    }
+    free(list->tokens);
+}
+
+/* init token list */
+token_list *init_token_list() {
+    token_list *token_list_p;
+    token **tokens_ptr_array;
+
+    if ((token_list_p = malloc(sizeof(token_list))) == NULL) {
         perror("malloc");
         return NULL;
     }
 
+    if ((tokens_ptr_array = (token **)malloc(INITIAL_CAPACITY * sizeof(token *))) == NULL) {
+        perror("malloc");
+        free(token_list_p);
+        return NULL;
+    }
+
+    token_list_p->token_count = 0;
+    token_list_p->tokens = tokens_ptr_array;
+    token_list_p->capacity = INITIAL_CAPACITY;
+    return token_list_p;
+}
+
+/* Extract string */
+char *extract_quoted_string(char **input) {
+    char quote = **input;
+    char *start = ++(*input);
+    char *result_string = malloc(1);
+    if (!result_string)
+        return NULL;
+
+    *result_string = '\0'; // empty string
+    int result_string_len = 0;
+
+    while (**input && **input != quote) {
+        /* env variables within string */
+        if (quote == '"' && **input == '$') {
+            (*input)++;
+            char variable_name[256] = {0};
+            int variable_length = 0;
+
+            while (isalnum(**input) || **input == '_')
+                variable_name[variable_length++] = *(*input)++;
+
+            variable_name[variable_length] = '\0';
+            char *variable_value = getenv(variable_name);
+
+            if (variable_value) {
+                size_t actual_len = strlen(variable_value);
+                char *new_result_string = realloc(result_string, result_string_len + actual_len + 1);
+                if (!new_result_string) {
+                    free(result_string);
+                    return NULL;
+                }
+                result_string = new_result_string;
+                strcpy(result_string + result_string_len, variable_value);
+                result_string_len += actual_len;
+            }
+        } else {
+            /* Normal string */
+            char *new_result_string = realloc(result_string, result_string_len + 2);
+            if (!new_result_string) {
+                free(result_string);
+                return NULL;
+            }
+            result_string = new_result_string;
+            result_string[result_string_len++] = *(*input)++;
+            result_string[result_string_len] = '\0';
+        }
+    }
+
+    if (**input == quote)
+        (*input)++;
+
+    return result_string;
+}
+
+/* Extract tokens */
+token_list *tokenize(char *command) {
+    int in_quotes = 0;
+    char quote_char = '\0';
+    char *p = command;
+    char *start;
+    token_list *token_list_p = init_token_list();
+    token *tokens_ptr_array;
+    int expect_command = 1; // usually starts with a command
+
+    if ((token_list_p) == NULL)
+        return NULL;
+
     while (*p) {
-        // do magic
+        if (*p == '"' || *p == '\'') {
+            char *string = extract_quoted_string(&p);
+            if (!string) {
+                free_tokens(token_list_p);
+                return NULL;
+            }
+
+            if (add_token(token_list_p, TOKEN_STRING, string) < 0) {
+                free_tokens(token_list_p);
+                free(string);
+                return NULL;
+            }
+
+            free(string);
+
+            // move to next token
+            if (isspace(*p))
+                p++;
+
+        } else if (*p == '|' || *p == '>' || *p == '<' || *p == '&' || *p == ';') {
+            int added;
+            if (*p == '|') {
+                p++;
+                if (*p && *p == '|') {
+                    added = add_token(token_list_p, TOKEN_OR, "||");
+                    p++;
+                } else {
+                    added = add_token(token_list_p, TOKEN_PIPE, "|");
+                }
+            } else if (*p == '>') {
+                p++;
+                if (*p && *p == '>') {
+                    added = add_token(token_list_p, TOKEN_REDIRECT_APPEND, ">>");
+                    p++;
+                } else {
+                    added = add_token(token_list_p, TOKEN_REDIRECT_OUTPUT, ">");
+                }
+            } else if (*p == '<') {
+                added = add_token(token_list_p, TOKEN_REDIRECT_INPUT, "<");
+                p++;
+            } else if (*p == '&') {
+                p++;
+                if (*p && *p == '&') {
+                    added = add_token(token_list_p, TOKEN_AND, "&&");
+                    p++;
+                } else {
+                    added = add_token(token_list_p, TOKEN_BACKGROUND, "&");
+                }
+            } else {
+                added = add_token(token_list_p, TOKEN_SEMICOLON, ";");
+                p++;
+            }
+
+            if (added < 0) {
+                free_tokens(token_list_p);
+                return NULL;
+            }
+            expect_command = 1;
+            // move to next token
+            if (isspace(*p))
+                p++;
+
+        } else {
+            int added;
+            start = p;
+            while (*p && !isspace(*p) && *p != '|' && *p != '&' && *p != ';' && *p != '>' && *p != '<' && *p != '"' && *p != '\'')
+                p++;
+
+            size_t len = p - start;
+            char *str = strndup(start, len);
+
+            if (expect_command) {
+                added = add_token(token_list_p, TOKEN_COMMAND, str);
+                expect_command = 0;
+            } else {
+                added = add_token(token_list_p, TOKEN_ARGUMENT, str);
+            }
+            free(str);
+
+            if (added < 0) {
+                free_tokens(token_list_p);
+                return NULL;
+            }
+
+            if (isspace(*p))
+                p++;
+        }
+    }
+
+    return token_list_p;
+}
+
+/* Test */
+void print_tokens(token_list *token_list) {
+    for (int i = 0; i < token_list->token_count; i++) {
+        printf("Token: %-10s Type: %d\n", token_list->tokens[i]->value, token_list->tokens[i]->type);
     }
 }
 
