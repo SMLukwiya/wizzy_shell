@@ -97,9 +97,15 @@ void add_to_history(hist_buffer *history, char *command) {
 }
 
 hist_entry *get_entry(hist_buffer *history, int index) {
+    if (index < 0) {
+        /* offset */
+        index = history->entry_count + index;
+    }
+
     if (index < 0 || index >= history->entry_count)
         return NULL;
     int idx = (history->tail_index + index) % HISTSIZE;
+
     return &(history->entries[idx]);
 }
 
@@ -232,7 +238,6 @@ char *expand_history(shell_context *ctx, char *command) {
                 free(pattern);
             }
 
-            printf("commands in history: %s\n", history_entry->line);
             if (!history_entry) {
                 native_error("No commands in history");
                 free(expanded_command);
