@@ -13,7 +13,7 @@
 
 #define MAXLINE 8192
 #define MAXARGS 128
-#define HISTSIZE 4
+#define HISTSIZE 1000
 
 extern char **environ;
 
@@ -92,8 +92,8 @@ void add_to_history(hist_buffer *history, char *command) {
     entry_number++;
     entry.entry_num = entry_number;
     entry.line = strdup(command);
+    history->head_index = history->entry_count == 1 ? 0 : (history->head_index + 1) % HISTSIZE;
     history->entries[history->head_index] = entry;
-    history->head_index = (history->head_index + 1) % HISTSIZE;
 }
 
 hist_entry *get_entry(hist_buffer *history, int index) {
@@ -123,21 +123,6 @@ int exit_command(shell_context *ctx, char **args) {
 
     free(ctx->history->entries);
     exit(0);
-}
-
-int execute_prev_command(shell_context *ctx, char **args) {
-    if (ctx->history->entry_count == 0) {
-        native_error("No commands in history");
-        return 1;
-    }
-    char *argv[MAXARGS];
-    char *command = ctx->history->entries[ctx->history->head_index - 1].line;
-    add_to_history(ctx->history, command);
-    printf("%s\n", command);
-    int background = parse_command(command, argv);
-    int builtin_idx = is_builtin_command(argv[0]);
-    execute_command(ctx, argv, background, builtin_idx);
-    return 0;
 }
 
 builtin_command builtins[] = {
@@ -187,7 +172,101 @@ void trim_whitespace(char **start) {
     *(end + 1) = '\0';
 }
 
-// expand !!
+char *expand_history(shell_context *ctx, char *command) {
+    char *p = command;
+    size_t expanded_length = strlen(command) * 2; // anticipate
+    char *expanded_command = (char *)malloc(expanded_length);
+    char *current_pos = expanded_command;
+    *current_pos = '\0'; // empty string
+    char *end_pos = expanded_command + expanded_length - 1;
+
+    if (!expanded_command) {
+        perror("malloc");
+        return NULL;
+    }
+
+    while (*p) {
+        if (*p == '!') {
+            p++;
+            hist_entry *history_entry = NULL;
+
+            if (*p == '!') { // !
+                p++;
+                history_entry = get_entry(ctx->history, ctx->history->head_index);
+            } else if (isdigit(*p)) {
+                int index = 0;
+                /* extract digit */
+                while (isdigit(*p)) { // !n
+                    index = (index * 10) + (*p - '0');
+                    p++;
+                }
+
+                history_entry = get_entry(ctx->history, index - 1); // zero based(idx-1)
+            } else if (*p == '-') {                                 // !-n
+                p++;
+                int offset = 0;
+                /* extract offset */
+                while (isdigit(*p)) {
+                    offset = (offset * 10) + (*p - '0');
+                    p++;
+                }
+
+                history_entry = get_entry(ctx->history, -offset);
+            } else { // !pattern
+                const char *start = p;
+                /* extract pattern */
+                while (*p && !isspace(*p))
+                    p++;
+
+                size_t pattern_length = p - start;
+                char *pattern = strndup(start, pattern_length);
+
+                /* try and get recent command with pattern */
+                for (int i = ctx->history->entry_count - 1; i >= 0; i++) {
+                    hist_entry *entry = get_entry(ctx->history, i);
+                    if (strncmp(entry->line, pattern, pattern_length) == 0) {
+                        history_entry = entry;
+                        break;
+                    }
+                }
+                free(pattern);
+            }
+
+            printf("commands in history: %s\n", history_entry->line);
+            if (!history_entry) {
+                native_error("No commands in history");
+                free(expanded_command);
+                return NULL;
+            }
+
+            if (current_pos == end_pos) {
+                size_t len = strlen(expanded_command);
+                expanded_length *= 2;
+                expanded_command = realloc(expanded_command, expanded_length);
+                end_pos = expanded_command + expanded_length;
+                current_pos = expanded_command + len;
+            }
+            strcat(expanded_command, history_entry->line);
+            current_pos += strlen(history_entry->line);
+        } else {
+            if (current_pos == end_pos) {
+                size_t len = strlen(expanded_command);
+                expanded_length *= 2;
+                expanded_command = realloc(expanded_command, expanded_length);
+                end_pos = expanded_command + expanded_length;
+                current_pos = expanded_command + len;
+            }
+            *current_pos = *p;
+            current_pos++;
+            *current_pos = '\0';
+            p++;
+        }
+    }
+    // realloc one last time
+    size_t actual_size = strlen(expanded_command);
+    expanded_command = realloc(expanded_command, actual_size);
+    return expanded_command;
+}
 
 int parse_command(char *command, char **argv) {
     char *token;
@@ -242,22 +321,31 @@ void execute_command(shell_context *ctx, char **argv, int background, int builti
 
 void eval_command(char *command, shell_context *ctx) {
     char *argv[MAXARGS];
-    char buf[MAXLINE];
     int background;
     int status;
     int builtin_idx;
+    int expanded = 0;
+    char *expanded_command = command;
 
-    trim_whitespace(&command);
-    strcpy(buf, command);
+    trim_whitespace(&expanded_command);
+    if (strchr(expanded_command, '!') != NULL) {
+        if ((expanded_command = expand_history(ctx, expanded_command)) != NULL) {
+            expanded = 1;
+        }
+    }
+
+    add_to_history(ctx->history, expanded_command);
     memset(argv, 0, sizeof(argv));
-    background = parse_command(buf, argv);
+    background = parse_command(expanded_command, argv);
 
     if (!argv[0])
         return;
 
-    add_to_history(ctx->history, command);
     builtin_idx = is_builtin_command(argv[0]);
+    int i = 0;
     execute_command(ctx, argv, background, builtin_idx);
+    if (expanded)
+        free(expanded_command);
     return;
 }
 
