@@ -14,6 +14,7 @@
 #define MAXLINE 8192
 #define MAXARGS 128
 #define HISTSIZE 1000
+#define MIN(x, y) (x > y ? y : x)
 
 extern char **environ;
 
@@ -168,10 +169,6 @@ void trim_whitespace(char **start) {
     while (isspace((unsigned char)**start))
         (*start)++;
 
-    /* empty command */
-    if (**start == '\0')
-        return;
-
     end = *start + strlen(*start) - 1;
     while (end > *start && isspace((unsigned char)*end))
         end--;
@@ -224,13 +221,12 @@ char *expand_history(shell_context *ctx, char *command) {
                 while (*p && !isspace(*p))
                     p++;
 
-                size_t pattern_length = p - start;
-                char *pattern = strndup(start, pattern_length);
-
+                size_t str_length = p - start;
+                char *pattern = strndup(start, str_length);
                 /* try and get recent command with pattern */
-                for (int i = ctx->history->entry_count - 1; i >= 0; i++) {
+                for (int i = ctx->history->entry_count - 1; i >= 0; i--) {
                     hist_entry *entry = get_entry(ctx->history, i);
-                    if (strncmp(entry->line, pattern, pattern_length) == 0) {
+                    if (strncmp(entry->line, pattern, MIN(str_length, strlen(entry->line))) == 0) {
                         history_entry = entry;
                         break;
                     }
@@ -333,6 +329,10 @@ void eval_command(char *command, shell_context *ctx) {
     char *expanded_command = command;
 
     trim_whitespace(&expanded_command);
+    /* empty command */
+    if (*expanded_command == '\0')
+        return;
+
     if (strchr(expanded_command, '!') != NULL) {
         if ((expanded_command = expand_history(ctx, expanded_command)) != NULL) {
             expanded = 1;
