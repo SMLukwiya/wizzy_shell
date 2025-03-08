@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
@@ -51,6 +52,7 @@ enum token_type {
     TOKEN_REDIRECT_INPUT,
     TOKEN_REDIRECT_APPEND,
     TOKEN_REDIRECT_ERROR,
+    TOKEN_REDIRECT_ERROR_APPEND,
     TOKEN_BACKGROUND,
     TOKEN_SEMICOLON,
     TOKEN_AND,
@@ -71,17 +73,39 @@ typedef struct {
     token **tokens;
     int token_count;
     int capacity;
+    int position; // for parsing tokens later
 } token_list;
+
+typedef enum {
+    NODE_COMMAND,
+    NODE_PIPE,
+    NODE_AND,
+    NODE_OR,
+    NODE_REDIRECT_OUT,
+    NODE_REDIRECT_APPEND,
+    NODE_REDIRECT_IN,
+    NODE_REDIRECT_ERR
+} AST_node_type;
+
+typedef struct AST_node {
+    AST_node_type type;
+    char **command;
+    char *filename;
+    struct AST_node *left;
+    struct AST_node *right;
+    int background;
+} AST_node;
 
 int entry_number;
 char *command_buf;
 // remove after finishing
-token_list *list;
+token_list *list = NULL;
 
 /* APIS */
 void execute_command(shell_context *ctx, char **argv, int background, int builtin_idx);
 int parse_command(char *command, char **argv);
 int is_builtin_command(char *command);
+void free_tokens(token_list *list);
 
 void unix_error(char *msg) {
     fprintf(stderr, "%s: %s\n", msg, strerror(errno));
@@ -168,8 +192,9 @@ int exit_command(shell_context *ctx, char **args) {
         free(ctx->history->entries[i].line);
 
     free(ctx->history->entries);
-    if (list)
-        free(list);
+    if (list) {
+        free_tokens(list);
+    }
     exit(0);
 }
 
@@ -320,7 +345,8 @@ char *expand_history(shell_context *ctx, char *command) {
 /* Tokenization */
 /* add to token list */
 int add_token(token_list *list, enum token_type token_type, const char *token_value) {
-    if (list->token_count >= list->capacity) {
+    /* Make room to null terminate */
+    if (list->token_count >= list->capacity - 1) {
         list->capacity *= 2;
         list->tokens = realloc(list->tokens, list->capacity * sizeof(token *));
         if (!list->tokens) {
@@ -355,6 +381,7 @@ void free_tokens(token_list *list) {
         free(list->tokens[i]);
     }
     free(list->tokens);
+    printf("Did free list\n");
 }
 
 /* init token list */
@@ -376,6 +403,7 @@ token_list *init_token_list() {
     token_list_p->token_count = 0;
     token_list_p->tokens = tokens_ptr_array;
     token_list_p->capacity = INITIAL_CAPACITY;
+    token_list_p->position = 0;
     return token_list_p;
 }
 
@@ -447,7 +475,9 @@ token_list *tokenize(char *command) {
         return NULL;
 
     while (*p) {
-        if (*p == '"' || *p == '\'') {
+        if (isspace(*p) && !in_quotes) {
+            p++;
+        } else if (*p == '"' || *p == '\'') {
             char *string = extract_quoted_string(&p);
             if (!string) {
                 free_tokens(token_list_p);
@@ -462,11 +492,7 @@ token_list *tokenize(char *command) {
 
             free(string);
 
-            // move to next token
-            if (isspace(*p))
-                p++;
-
-        } else if (*p == '|' || *p == '>' || *p == '<' || *p == '&' || *p == ';') {
+        } else if (*p == '|' || *p == '>' || *p == '<' || *p == '&' || *p == ';' || *p == '2') {
             int added;
             if (*p == '|') {
                 p++;
@@ -475,6 +501,16 @@ token_list *tokenize(char *command) {
                     p++;
                 } else {
                     added = add_token(token_list_p, TOKEN_PIPE, "|");
+                }
+                expect_command = 1;
+
+            } else if (*p == '2' && *(p + 1) == '>') {
+                p += 2;
+                if (*p && *p == '>') {
+                    added = add_token(token_list_p, TOKEN_REDIRECT_ERROR_APPEND, "2>>");
+                    p++;
+                } else {
+                    added = add_token(token_list_p, TOKEN_REDIRECT_ERROR, "2>");
                 }
             } else if (*p == '>') {
                 p++;
@@ -495,8 +531,11 @@ token_list *tokenize(char *command) {
                 } else {
                     added = add_token(token_list_p, TOKEN_BACKGROUND, "&");
                 }
-            } else {
+                expect_command = 1;
+
+            } else if (*p == ';') {
                 added = add_token(token_list_p, TOKEN_SEMICOLON, ";");
+                expect_command = 1;
                 p++;
             }
 
@@ -504,10 +543,6 @@ token_list *tokenize(char *command) {
                 free_tokens(token_list_p);
                 return NULL;
             }
-            expect_command = 1;
-            // move to next token
-            if (isspace(*p))
-                p++;
 
         } else {
             int added;
@@ -530,12 +565,10 @@ token_list *tokenize(char *command) {
                 free_tokens(token_list_p);
                 return NULL;
             }
-
-            if (isspace(*p))
-                p++;
         }
     }
 
+    token_list_p->tokens[token_list_p->token_count] = NULL;
     return token_list_p;
 }
 
@@ -546,6 +579,325 @@ void print_tokens(token_list *token_list) {
     }
 }
 
+/* ======= PARSER ======= */
+AST_node *create_command_node(char **command) {
+    AST_node *node = malloc(sizeof(AST_node));
+    if (!node) {
+        perror("malloc");
+        return NULL;
+    }
+    node->command = command;
+    node->filename = NULL;
+    node->type = NODE_COMMAND;
+    node->left = NULL;
+    node->right = NULL;
+    node->background = 0;
+
+    return node;
+}
+
+AST_node *create_operator_node(AST_node_type type, AST_node *left, AST_node *right) {
+    AST_node *node = malloc(sizeof(AST_node));
+    if (!node) {
+        perror("malloc");
+        return NULL;
+    }
+    node->command = NULL;
+    node->filename = NULL;
+    node->type = type;
+    node->left = left;
+    node->right = right;
+
+    return node;
+}
+
+AST_node *create_redirect_node(AST_node_type type, char *filename, AST_node *left) {
+    AST_node *node = malloc(sizeof(AST_node));
+    if (!node) {
+        perror("malloc");
+        return NULL;
+    }
+    node->command = NULL;
+    node->filename = filename;
+    node->type = type;
+    node->left = left;
+    node->right = NULL;
+
+    return node;
+}
+
+void free_ast_node(AST_node *node) {
+    if (!node)
+        return;
+    free_ast_node(node->left);
+    free_ast_node(node->right);
+    if (node->command) {
+        for (int i = 0; node->command[i]; i++)
+            free(node->command[i]);
+        free(node->command);
+    }
+    if (node->filename)
+        free(node->filename);
+}
+
+token *peek(token_list *list) {
+    if (list->position < list->token_count)
+        return list->tokens[list->position];
+    return NULL;
+}
+
+/* consume until NULL since token list is null terminated */
+void consume(token_list *list) {
+    if (list->position < list->token_count)
+        list->position++;
+}
+
+/* Parse command, assumes entire list could be command and it's args */
+AST_node *parse_command_1(token_list *list) {
+    token *tok = peek(list);
+    if (!tok || tok->type != TOKEN_COMMAND)
+        return NULL;
+
+    char **args = malloc(sizeof(char *) * (list->token_count + 1));
+    int arg_count = 0;
+
+    while (tok && (tok->type == TOKEN_COMMAND || tok->type == TOKEN_ARGUMENT)) {
+        args[arg_count++] = strdup(tok->value);
+        consume(list);
+        tok = peek(list);
+    }
+    args[arg_count] = NULL;
+    return create_command_node(args);
+}
+
+AST_node *parse_redirection(token_list *list) {
+    /* construct left side ready for the redirection */
+    AST_node *command = parse_command_1(list);
+    token *tok = peek(list);
+
+    while (tok && (tok->type == TOKEN_REDIRECT_OUTPUT || tok->type == TOKEN_REDIRECT_INPUT || tok->type == TOKEN_REDIRECT_ERROR || tok->type == TOKEN_REDIRECT_APPEND || tok->type == TOKEN_REDIRECT_ERROR_APPEND)) {
+        /* move past redirection | */
+        consume(list);
+        token *filename_token = peek(list);
+        if (!filename_token) {
+            native_error("syntax error: filename expected for redirection");
+            return NULL;
+        }
+        char *filename = strdup(filename_token->value);
+
+        // create look up table for node types
+        AST_node_type node_type;
+        if (tok->type == TOKEN_REDIRECT_OUTPUT)
+            node_type = NODE_REDIRECT_OUT;
+        else if (tok->type == TOKEN_REDIRECT_INPUT)
+            node_type = NODE_REDIRECT_IN;
+        else if (tok->type == TOKEN_REDIRECT_ERROR)
+            node_type = NODE_REDIRECT_ERR;
+        else if (tok->type == TOKEN_REDIRECT_APPEND)
+            node_type = NODE_REDIRECT_APPEND;
+
+        command = create_redirect_node(node_type, filename, command);
+        consume(list);
+        tok = peek(list);
+    }
+
+    return command;
+}
+
+AST_node *parse_pipeline(token_list *list) {
+    AST_node *l_command = parse_redirection(list);
+    token *tok = peek(list);
+
+    while (tok && tok->type == TOKEN_PIPE) {
+        consume(list);
+        AST_node *r_command = parse_redirection(list);
+        l_command = create_operator_node(NODE_PIPE, l_command, r_command);
+        tok = peek(list);
+    }
+
+    return l_command;
+}
+
+AST_node *parse_background(token_list *list) {
+    AST_node *l_command = parse_pipeline(list);
+    token *tok = peek(list);
+
+    while (tok && tok->type == TOKEN_BACKGROUND) {
+        consume(list);
+        /* Check for common syntax errors */
+        tok = peek(list);
+        if (tok && (tok->type == TOKEN_PIPE || tok->type == TOKEN_OR || tok->type == TOKEN_AND)) {
+            fprintf(stderr, "syntax error near unexpected token %s\n", tok->value);
+            return NULL;
+        }
+        l_command->background = 1;
+        // AST_node *r_command = parse_pipeline(list);
+    }
+
+    return l_command;
+}
+
+AST_node *parse_logical(token_list *list) {
+    AST_node *l_command = parse_background(list);
+    token *tok = peek(list);
+
+    while (tok && (tok->type == TOKEN_AND || tok->type == TOKEN_OR)) {
+        AST_node_type node_type = tok->type == TOKEN_AND ? NODE_AND : NODE_OR;
+        consume(list);
+        AST_node *r_command = parse_background(list);
+        l_command = create_operator_node(node_type, l_command, r_command);
+        tok = peek(list);
+    }
+
+    return l_command;
+}
+
+/* Entry */
+AST_node *parse(token_list *list) {
+    return parse_logical(list);
+}
+
+/* =========== Execution =========== */
+void execute_command_(AST_node *node) {
+    int status;
+    if (!node || node->type != NODE_COMMAND)
+        return;
+
+    pid_t pid;
+
+    if ((pid = fork()) < 0)
+        return;
+
+    if (pid == 0) {
+        if (execvp(node->command[0], node->command) < 0)
+            unix_error("execvp");
+    } else {
+        if (!node->background) {
+            waitpid(pid, &status, 0);
+        } else {
+            printf("%d\n", pid);
+        }
+    }
+
+    return;
+}
+
+void execute_redirect_out(AST_node *node) {
+    if (!node || node->type != NODE_REDIRECT_OUT)
+        ;
+
+    int fd;
+    if ((fd = open(node->filename, O_WRONLY | O_CREAT, 0644)) < 0)
+        return;
+
+    dup2(fd, STDOUT_FILENO);
+    close(fd);
+    execute_command_(node->left);
+}
+
+void execute_pipe(AST_node *node) {
+    if (!node || node->type != NODE_PIPE)
+        return;
+
+    int pipefds[2];
+    pid_t pid;
+
+    if (pipe(pipefds) < 0)
+        return;
+
+    if ((pid = fork()) < 0) {
+        close(pipefds[0]);
+        close(pipefds[1]);
+        return;
+    }
+
+    if (pid == 0) {
+        close(pipefds[0]);
+        dup2(pipefds[1], STDOUT_FILENO);
+        close(pipefds[1]);
+        execute_command_(node->left);
+        exit(0);
+    }
+
+    if ((pid = fork()) < 0) {
+        close(pipefds[0]);
+        close(pipefds[1]);
+        return;
+    }
+
+    if (pid == 0) {
+        close(pipefds[1]);
+        dup2(pipefds[0], STDIN_FILENO);
+        close(pipefds[0]);
+        execute_command_(node->right);
+        exit(0);
+    }
+
+    close(pipefds[0]);
+    close(pipefds[1]);
+    wait(NULL);
+    wait(NULL);
+    return;
+}
+
+void execute(AST_node *node) {
+    if (!node)
+        return;
+
+    switch (node->type) {
+    case NODE_COMMAND:
+        execute_command_(node);
+        break;
+    case NODE_REDIRECT_OUT:
+        execute_redirect_out(node);
+        break;
+    case NODE_PIPE:
+        execute_command_(node);
+        break;
+    default:
+        fprintf(stderr, "Unknown node type\n");
+    }
+}
+
+void print_ast_tree(AST_node *node) {
+    if (node == NULL) {
+        return;
+    }
+
+    switch (node->type) {
+    case NODE_COMMAND:
+        printf("Ast Command: ");
+        for (int i = 0; node->command[i] != NULL; i++) {
+            printf("%s ", node->command[i]);
+        }
+        printf("Background: %d", node->background);
+        printf("\n");
+        break;
+    case NODE_PIPE:
+        printf("Pipe:\n");
+        print_ast_tree(node->left);
+        print_ast_tree(node->right);
+        break;
+    case NODE_REDIRECT_OUT:
+        printf("Redirect Out: %s\n", node->filename);
+        print_ast_tree(node->left);
+        break;
+
+    case NODE_OR:
+        printf("Logical or\n");
+        print_ast_tree(node->left);
+        print_ast_tree(node->right);
+        break;
+
+    case NODE_AND:
+        printf("Logical AND\n");
+        print_ast_tree(node->left);
+        print_ast_tree(node->right);
+        break;
+    default:
+        fprintf(stderr, "Not a damn thing here!\n");
+    }
+}
 /* Parse user input */
 int parse_command(char *command, char **argv) {
     char *token;
@@ -615,6 +967,16 @@ void eval_command(char *command, shell_context *ctx) {
         }
     }
 
+    list = tokenize(expanded_command);
+    if (!list) {
+        printf("Could not init");
+    }
+    print_tokens(list);
+
+    AST_node *node = parse(list);
+    print_ast_tree(node);
+    free_ast_node(node);
+
     add_to_history(ctx->history, expanded_command);
     memset(argv, 0, sizeof(argv));
     background = parse_command(expanded_command, argv);
@@ -667,3 +1029,9 @@ int main(int argc, char **argv) {
         eval_command(command, &ctx);
     }
 }
+
+/*
+<<
+<<<
+2>&1
+*/
