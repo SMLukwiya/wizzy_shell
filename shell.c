@@ -98,12 +98,10 @@ typedef struct AST_node {
 
 int entry_number;
 char *command_buf;
-// remove after finishing
-token_list *list = NULL;
 
 /* APIS */
 void execute_command(shell_context *ctx, char **argv, int background, int builtin_idx);
-int parse_command(char *command, char **argv);
+AST_node *parse_command(token_list *list);
 int is_builtin_command(char *command);
 void free_tokens(token_list *list);
 
@@ -192,9 +190,6 @@ int exit_command(shell_context *ctx, char **args) {
         free(ctx->history->entries[i].line);
 
     free(ctx->history->entries);
-    if (list) {
-        free_tokens(list);
-    }
     exit(0);
 }
 
@@ -204,7 +199,7 @@ builtin_command builtins[] = {
   {"exit", exit_command},
   {NULL, NULL}};
 
-/* Is command builtin */
+/* command builtin */
 int is_builtin_command(char *command) {
     for (int i = 0; builtins[i].command_name != NULL; i++)
         if (strcmp(command, builtins[i].command_name) == 0)
@@ -343,7 +338,6 @@ char *expand_history(shell_context *ctx, char *command) {
 }
 
 /* Tokenization */
-/* add to token list */
 int add_token(token_list *list, enum token_type token_type, const char *token_value) {
     /* Make room to null terminate */
     if (list->token_count >= list->capacity - 1) {
@@ -381,7 +375,6 @@ void free_tokens(token_list *list) {
         free(list->tokens[i]);
     }
     free(list->tokens);
-    printf("Did free list\n");
 }
 
 /* init token list */
@@ -653,7 +646,7 @@ void consume(token_list *list) {
 }
 
 /* Parse command, assumes entire list could be command and it's args */
-AST_node *parse_command_1(token_list *list) {
+AST_node *parse_command(token_list *list) {
     token *tok = peek(list);
     if (!tok || tok->type != TOKEN_COMMAND)
         return NULL;
@@ -661,7 +654,7 @@ AST_node *parse_command_1(token_list *list) {
     char **args = malloc(sizeof(char *) * (list->token_count + 1));
     int arg_count = 0;
 
-    while (tok && (tok->type == TOKEN_COMMAND || tok->type == TOKEN_ARGUMENT)) {
+    while (tok && (tok->type == TOKEN_COMMAND || tok->type == TOKEN_ARGUMENT || tok->type == TOKEN_STRING)) {
         args[arg_count++] = strdup(tok->value);
         consume(list);
         tok = peek(list);
@@ -672,7 +665,7 @@ AST_node *parse_command_1(token_list *list) {
 
 AST_node *parse_redirection(token_list *list) {
     /* construct left side ready for the redirection */
-    AST_node *command = parse_command_1(list);
+    AST_node *command = parse_command(list);
     token *tok = peek(list);
 
     while (tok && (tok->type == TOKEN_REDIRECT_OUTPUT || tok->type == TOKEN_REDIRECT_INPUT || tok->type == TOKEN_REDIRECT_ERROR || tok->type == TOKEN_REDIRECT_APPEND || tok->type == TOKEN_REDIRECT_ERROR_APPEND)) {
@@ -731,7 +724,7 @@ AST_node *parse_background(token_list *list) {
             return NULL;
         }
         l_command->background = 1;
-        // AST_node *r_command = parse_pipeline(list);
+        // Fix background (&) priority
     }
 
     return l_command;
@@ -758,15 +751,17 @@ AST_node *parse(token_list *list) {
 }
 
 /* =========== Execution =========== */
-void execute_command_(AST_node *node) {
+void execute_ext_command(AST_node *node) {
     int status;
     if (!node || node->type != NODE_COMMAND)
         return;
 
     pid_t pid;
 
-    if ((pid = fork()) < 0)
+    if ((pid = fork()) < 0) {
+        perror("fork");
         return;
+    }
 
     if (pid == 0) {
         if (execvp(node->command[0], node->command) < 0)
@@ -778,21 +773,71 @@ void execute_command_(AST_node *node) {
             printf("%d\n", pid);
         }
     }
-
     return;
+}
+
+void execute_built_in(AST_node *node, shell_context *ctx, int index) {
+    if (!node || node->type != NODE_COMMAND)
+        return;
+
+    pid_t pid;
+
+    if (!node->background)
+        builtins[index].function(ctx, node->command);
+    else {
+        if ((pid = fork()) < 0)
+            unix_error("fork");
+
+        if (pid == 0) {
+            if ((execvp(node->command[0], node->command)))
+                unix_error("execvp");
+            exit(0);
+        } else {
+            printf("%d\n", (int)pid);
+        }
+    }
 }
 
 void execute_redirect_out(AST_node *node) {
     if (!node || node->type != NODE_REDIRECT_OUT)
-        ;
+        return;
 
     int fd;
-    if ((fd = open(node->filename, O_WRONLY | O_CREAT, 0644)) < 0)
+    if ((fd = open(node->filename, O_WRONLY | O_CREAT, 0644)) < 0) {
+        perror("open");
         return;
+    }
+    int original_stdout = dup(STDOUT_FILENO);
 
     dup2(fd, STDOUT_FILENO);
     close(fd);
-    execute_command_(node->left);
+    execute_ext_command(node->left);
+
+    /* restore stdout */
+    dup2(original_stdout, STDOUT_FILENO);
+    close(original_stdout);
+    return;
+}
+
+void execute_redirect_in(AST_node *node) {
+    if (!node || node->type != NODE_REDIRECT_IN)
+        return;
+
+    int fd;
+    if ((fd = open(node->filename, O_RDONLY, 0666)) < 0) {
+        perror("open");
+        return;
+    }
+    int original_stdin = dup(STDIN_FILENO);
+
+    dup2(fd, STDIN_FILENO);
+    close(fd);
+    execute_ext_command(node->left);
+
+    /* restore stdin */
+    dup2(original_stdin, STDIN_FILENO);
+    close(original_stdin);
+    return;
 }
 
 void execute_pipe(AST_node *node) {
@@ -802,10 +847,13 @@ void execute_pipe(AST_node *node) {
     int pipefds[2];
     pid_t pid;
 
-    if (pipe(pipefds) < 0)
+    if (pipe(pipefds) < 0) {
+        perror("pipe");
         return;
+    }
 
     if ((pid = fork()) < 0) {
+        perror("fork");
         close(pipefds[0]);
         close(pipefds[1]);
         return;
@@ -815,11 +863,12 @@ void execute_pipe(AST_node *node) {
         close(pipefds[0]);
         dup2(pipefds[1], STDOUT_FILENO);
         close(pipefds[1]);
-        execute_command_(node->left);
+        execute_ext_command(node->left);
         exit(0);
     }
 
     if ((pid = fork()) < 0) {
+        perror("fork");
         close(pipefds[0]);
         close(pipefds[1]);
         return;
@@ -829,7 +878,7 @@ void execute_pipe(AST_node *node) {
         close(pipefds[1]);
         dup2(pipefds[0], STDIN_FILENO);
         close(pipefds[0]);
-        execute_command_(node->right);
+        execute_ext_command(node->right);
         exit(0);
     }
 
@@ -840,19 +889,26 @@ void execute_pipe(AST_node *node) {
     return;
 }
 
-void execute(AST_node *node) {
+void execute(AST_node *node, shell_context *ctx) {
     if (!node)
         return;
 
     switch (node->type) {
     case NODE_COMMAND:
-        execute_command_(node);
+        int idx;
+        if ((idx = is_builtin_command(node->command[0])) != -1)
+            builtins[idx].function(ctx, node->command);
+        else
+            execute_ext_command(node);
         break;
     case NODE_REDIRECT_OUT:
         execute_redirect_out(node);
         break;
+    case NODE_REDIRECT_IN:
+        execute_redirect_in(node);
+        break;
     case NODE_PIPE:
-        execute_command_(node);
+        execute_pipe(node);
         break;
     default:
         fprintf(stderr, "Unknown node type\n");
@@ -867,7 +923,7 @@ void print_ast_tree(AST_node *node) {
     switch (node->type) {
     case NODE_COMMAND:
         printf("Ast Command: ");
-        for (int i = 0; node->command[i] != NULL; i++) {
+        for (int i = 0; node->command[i]; i++) {
             printf("%s ", node->command[i]);
         }
         printf("Background: %d", node->background);
@@ -882,9 +938,12 @@ void print_ast_tree(AST_node *node) {
         printf("Redirect Out: %s\n", node->filename);
         print_ast_tree(node->left);
         break;
-
+    case NODE_REDIRECT_IN:
+        printf("Redirect In: %s\n", node->filename);
+        print_ast_tree(node->left);
+        break;
     case NODE_OR:
-        printf("Logical or\n");
+        printf("Logical OR\n");
         print_ast_tree(node->left);
         print_ast_tree(node->right);
         break;
@@ -895,56 +954,8 @@ void print_ast_tree(AST_node *node) {
         print_ast_tree(node->right);
         break;
     default:
-        fprintf(stderr, "Not a damn thing here!\n");
+        fprintf(stderr, "Not a damn thing here yet!\n");
     }
-}
-/* Parse user input */
-int parse_command(char *command, char **argv) {
-    char *token;
-    char *delimiter = " \t";
-    int argc, background;
-
-    token = strtok(command, delimiter);
-
-    argc = 0;
-    while (token != NULL) {
-        argv[argc++] = token;
-        token = strtok(NULL, delimiter);
-    }
-
-    if ((background = (*argv[argc - 1]) == '&'))
-        argc--;
-    argv[argc] = NULL;
-    return background;
-}
-
-/* Execute parsed command */
-void execute_command(shell_context *ctx, char **argv, int background, int builtin_idx) {
-    pid_t pid;
-    int status;
-
-    if (builtin_idx != -1 && !background) {
-        builtins[builtin_idx].function(ctx, argv);
-    } else {
-        if ((pid = fork()) < 0)
-            unix_error("fork");
-
-        if (pid == 0) {
-            if (builtin_idx != -1)
-                builtins[builtin_idx].function(ctx, argv);
-            else {
-                if (execvp(argv[0], argv) < 0)
-                    unix_error("execvp");
-            }
-        } else {
-            if (!background) {
-                waitpid(pid, &status, 0);
-            } else {
-                printf("%d\n", pid);
-            }
-        }
-    }
-    return;
 }
 
 /*Evaluate command */
@@ -967,28 +978,24 @@ void eval_command(char *command, shell_context *ctx) {
         }
     }
 
-    list = tokenize(expanded_command);
-    if (!list) {
-        printf("Could not init");
-    }
-    print_tokens(list);
-
-    AST_node *node = parse(list);
-    print_ast_tree(node);
-    free_ast_node(node);
-
     add_to_history(ctx->history, expanded_command);
-    memset(argv, 0, sizeof(argv));
-    background = parse_command(expanded_command, argv);
+    token_list *list = tokenize(expanded_command);
 
-    if (!argv[0])
-        return;
-
-    builtin_idx = is_builtin_command(argv[0]);
-    int i = 0;
-    execute_command(ctx, argv, background, builtin_idx);
     if (expanded)
         free(expanded_command);
+
+    if (!list)
+        return;
+
+    AST_node *root_node = parse(list);
+    free_tokens(list);
+
+    if (!root_node)
+        return;
+    // print_ast_tree(root_node);
+
+    execute(root_node, ctx);
+    free_ast_node(root_node);
     return;
 }
 
